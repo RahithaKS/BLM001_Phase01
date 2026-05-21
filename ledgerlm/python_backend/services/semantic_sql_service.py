@@ -11320,9 +11320,30 @@ Return a JSON object with:
         sql_queries: List[str] = []
         failed: List[str] = []
 
+        _MONTH_STR_TO_INT = {
+            'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+            'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
+            'january': 1, 'february': 2, 'march': 3, 'april': 4,
+            'june': 6, 'july': 7, 'august': 8, 'september': 9,
+            'october': 10, 'november': 11, 'december': 12,
+        }
+
+        def _normalize_month(val):
+            if isinstance(val, str):
+                return _MONTH_STR_TO_INT.get(val.lower().strip(), val)
+            return val
+
         for metric_id in metric_ids:
             metric_intent = copy.deepcopy(intent)
             metric_intent['use_calculation'] = metric_id
+
+            # Normalize month: LLM sometimes returns 'Jan' (string) instead of 1 (int)
+            if 'month' in metric_intent:
+                metric_intent['month'] = _normalize_month(metric_intent['month'])
+            for f in metric_intent.get('filters', []):
+                if f.get('column') == 'month':
+                    f['value'] = _normalize_month(f.get('value'))
+
             try:
                 compile_result = self.compile_calculation_sql(metric_id, cube_id, metric_intent, domain)
                 if not compile_result.get('success'):
