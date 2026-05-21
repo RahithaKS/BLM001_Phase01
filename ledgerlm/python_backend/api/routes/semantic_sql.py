@@ -177,35 +177,47 @@ async def execute_structured_query(request: StructuredQueryRequest):
                 error=f"Failed to compile SQL: {sql_result.get('error')}"
             )
         
-        generated_sql = sql_result['sql']
-        params = sql_result['params']
         calc_type = sql_result.get('calculation_type', 'unknown')
-        logger.info(
-            f"\n{'='*60}\n"
-            f"[SQL_EXEC] metric     = {calc_type}\n"
-            f"[SQL_EXEC] params     = {params}\n"
-            f"[SQL_EXEC] sql        =\n{generated_sql}\n"
-            f"{'='*60}"
-        )
-        
-        exec_result = semantic_sql_service.execute_query(
-            generated_sql,
-            params,
-            request.cube_id,
-            "orchestrator",
-            skip_logging=True
-        )
-        
-        if not exec_result.get('success'):
-            return StructuredQueryResponse(
-                success=False,
-                error=f"Query execution failed: {exec_result.get('error')}"
+
+        # Multi-metric path: SQL already executed inside _compile_multi_metric_sql.
+        # Results, columns and execution_ms are embedded directly in the result dict.
+        if calc_type == 'multi_metric':
+            fact_results = sql_result['results']
+            generated_sql = sql_result.get('sql_query', '')
+            exec_result = {'execution_ms': sql_result.get('execution_ms', 0)}
+            logger.info(
+                f"[SQL_RESULT] metric=multi_metric | rows={len(fact_results)} "
+                f"| time={exec_result['execution_ms']}ms"
             )
-        
-        fact_results = exec_result['results']
-        logger.info(
-            f"[SQL_RESULT] metric={calc_type} | rows={len(fact_results)} | time={exec_result.get('execution_ms', '?')}ms"
-        )
+        else:
+            generated_sql = sql_result['sql']
+            params = sql_result['params']
+            logger.info(
+                f"\n{'='*60}\n"
+                f"[SQL_EXEC] metric     = {calc_type}\n"
+                f"[SQL_EXEC] params     = {params}\n"
+                f"[SQL_EXEC] sql        =\n{generated_sql}\n"
+                f"{'='*60}"
+            )
+
+            exec_result = semantic_sql_service.execute_query(
+                generated_sql,
+                params,
+                request.cube_id,
+                "orchestrator",
+                skip_logging=True
+            )
+
+            if not exec_result.get('success'):
+                return StructuredQueryResponse(
+                    success=False,
+                    error=f"Query execution failed: {exec_result.get('error')}"
+                )
+
+            fact_results = exec_result['results']
+            logger.info(
+                f"[SQL_RESULT] metric={calc_type} | rows={len(fact_results)} | time={exec_result.get('execution_ms', '?')}ms"
+            )
         
         # Combine plan data with fact data if both exist
         combined_results = []
