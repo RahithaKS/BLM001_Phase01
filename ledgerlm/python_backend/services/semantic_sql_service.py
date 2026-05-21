@@ -399,6 +399,32 @@ METRIC_CATALOG = {
         "Billing Utilization"
     },
 
+    "sx_internal_utilization": {
+        "builder": "_build_sx_internal_utilization_sql",
+        "description": "SX Internal Utilization % = Billed Capacity / Available Capacity * 100, filtered to New Service Area=SX and Resource Type=Internal",
+        "examples": [
+            "sx internal utilization", "sx internal utilization %",
+            "sx internal utilization percentage", "sx billing utilization",
+            "sx internal billing utilization", "sx utilization internal",
+            "internal utilization sx", "sx internal util"
+        ],
+        "column_used": "billed_capacity, allocated_capacity",
+        "cost_category": "Billing Utilization Summary"
+    },
+
+    "ms_internal_utilization": {
+        "builder": "_build_ms_internal_utilization_sql",
+        "description": "MS Internal Utilization % = Billed Capacity / Available Capacity * 100, filtered to New Service Area=MS and Resource Type=Internal",
+        "examples": [
+            "ms internal utilization", "ms internal utilization %",
+            "ms internal utilization percentage", "ms billing utilization",
+            "ms internal billing utilization", "ms utilization internal",
+            "internal utilization ms", "ms internal util"
+        ],
+        "column_used": "billed_capacity, allocated_capacity",
+        "cost_category": "Billing Utilization Summary"
+    },
+
     # Revenue Metrics
     "revenue": {
         "builder": "_build_revenue_sql",
@@ -7514,6 +7540,14 @@ Return a JSON object with:
                     return self._build_billing_utilization_sql(
                         where_parts, params, select_cols, group_by_clause,
                         rounding or 2, 'Billing Utilization')
+                elif catalog_key == 'sx_internal_utilization':
+                    return self._build_sx_internal_utilization_sql(
+                        where_parts, params, select_cols, group_by_clause,
+                        rounding or 2)
+                elif catalog_key == 'ms_internal_utilization':
+                    return self._build_ms_internal_utilization_sql(
+                        where_parts, params, select_cols, group_by_clause,
+                        rounding or 2)
                 elif catalog_key == 'revenue':
                     return self._build_revenue_sql(where_parts, params,
                                                    select_cols,
@@ -8357,6 +8391,100 @@ Return a JSON object with:
             'sql': sql,
             'params': params,
             'calculation_type': 'billing_utilization'
+        }
+
+    def _build_sx_internal_utilization_sql(
+            self,
+            where_parts: List[str],
+            params: List,
+            select_cols: str,
+            group_by_clause: str,
+            rounding: int,
+    ) -> Dict[str, Any]:
+        """SX Internal Utilization % — same formula as billing utilization,
+        hardcoded to New Service Area = 'SX' and Resource Type = 'Internal'.
+        Uses cost_category = 'Billing Utilization Summary'.
+        """
+        extra_where = list(where_parts) + [
+            "TRIM(cost_category) = %s",
+            "new_service_area = %s",
+            "resource_type = %s",
+        ]
+        extra_params = list(params) + ['Billing Utilization Summary', 'SX', 'Internal']
+        where_clause = " AND ".join(extra_where)
+        group_by_sql = f"GROUP BY {group_by_clause}" if group_by_clause else ""
+        order_by_sql = "ORDER BY sx_internal_utilization_pct DESC" if group_by_clause else ""
+        select_prefix = f"{select_cols}," if select_cols else ""
+        sql = f"""
+            SELECT
+                {select_prefix}
+                ROUND(
+                    100.0 * SUM(billed_capacity) / NULLIF(
+                        SUM(allocated_capacity) + SUM(not_allocated_capacity)
+                        + SUM(ms_capacity) + SUM(vkm_capacity)
+                        - SUM(non_linear_capacity),
+                        0
+                    ),
+                    {rounding}
+                ) AS sx_internal_utilization_pct
+            FROM cube_fact_data
+            WHERE {where_clause}
+            {group_by_sql}
+            {order_by_sql}
+        """
+        logger.info("Generated SX Internal Utilization % SQL (new_service_area=SX, resource_type=Internal)")
+        return {
+            'success': True,
+            'sql': sql,
+            'params': extra_params,
+            'calculation_type': 'sx_internal_utilization'
+        }
+
+    def _build_ms_internal_utilization_sql(
+            self,
+            where_parts: List[str],
+            params: List,
+            select_cols: str,
+            group_by_clause: str,
+            rounding: int,
+    ) -> Dict[str, Any]:
+        """MS Internal Utilization % — same formula as billing utilization,
+        hardcoded to New Service Area = 'MS' and Resource Type = 'Internal'.
+        Uses cost_category = 'Billing Utilization Summary'.
+        """
+        extra_where = list(where_parts) + [
+            "TRIM(cost_category) = %s",
+            "new_service_area = %s",
+            "resource_type = %s",
+        ]
+        extra_params = list(params) + ['Billing Utilization Summary', 'MS', 'Internal']
+        where_clause = " AND ".join(extra_where)
+        group_by_sql = f"GROUP BY {group_by_clause}" if group_by_clause else ""
+        order_by_sql = "ORDER BY ms_internal_utilization_pct DESC" if group_by_clause else ""
+        select_prefix = f"{select_cols}," if select_cols else ""
+        sql = f"""
+            SELECT
+                {select_prefix}
+                ROUND(
+                    100.0 * SUM(billed_capacity) / NULLIF(
+                        SUM(allocated_capacity) + SUM(not_allocated_capacity)
+                        + SUM(ms_capacity) + SUM(vkm_capacity)
+                        - SUM(non_linear_capacity),
+                        0
+                    ),
+                    {rounding}
+                ) AS ms_internal_utilization_pct
+            FROM cube_fact_data
+            WHERE {where_clause}
+            {group_by_sql}
+            {order_by_sql}
+        """
+        logger.info("Generated MS Internal Utilization % SQL (new_service_area=MS, resource_type=Internal)")
+        return {
+            'success': True,
+            'sql': sql,
+            'params': extra_params,
+            'calculation_type': 'ms_internal_utilization'
         }
 
     def _build_available_capacity_sql(self, where_parts: List[str],
