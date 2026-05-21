@@ -5066,6 +5066,7 @@ Return a JSON object with:
         # FAST PATH: Skip OpenAI if we've already matched a KPI calculation
         # This avoids token limit issues (429 errors) for known KPI queries
         # Any matched calculation from get_matching_calculation (DB or trigger dict) is trusted
+        _multi_metric_calcs: list = []  # set below when 2+ distinct calcs detected
         kpi_keywords = [
             'capacity', 'pyramid', 'mix', 'attrition', 'billing',
             'utilization', 'budget', 'ebit', 'revenue', 'price', 'available',
@@ -5094,6 +5095,7 @@ Return a JSON object with:
                         f"MULTI-METRIC: {len(all_unique_names)} calcs detected "
                         f"{all_unique_names} — skipping fast path, routing to LLM"
                     )
+                    _multi_metric_calcs = all_unique_names
                     # Fall through to LLM routing (do NOT return here)
                 else:
                     logger.info(
@@ -5258,9 +5260,16 @@ Return a JSON object with:
             intent = self.apply_default_time_filters(intent, cube_id,
                                                      time_scope)
 
-            # POST-PROCESSING: Set use_calculation if matching calculation found
-            # This triggers the KPI calculation SQL generation instead of regular aggregation
-            if matching_calc and not intent.get('use_calculation'):
+            # POST-PROCESSING: Set use_calculation (or multi_metric_calcs) if matching calc found
+            # When 2+ distinct calcs detected, store all names so compile_sql can run each
+            # independently via _compile_multi_metric_sql instead of picking just one.
+            if _multi_metric_calcs and len(_multi_metric_calcs) > 1:
+                intent['multi_metric_calcs'] = _multi_metric_calcs
+                # Remove any single use_calculation the LLM may have set
+                intent.pop('use_calculation', None)
+                logger.info(
+                    f"Set multi_metric_calcs in intent: {_multi_metric_calcs}")
+            elif matching_calc and not intent.get('use_calculation'):
                 calc_name = matching_calc.get('calculation_name', '')
                 if calc_name:
                     intent['use_calculation'] = calc_name
@@ -11474,6 +11483,37 @@ Return a JSON object with:
                     f"compile_sql: Entity P&L EBIT fast path, calc_type='{_epl_ebit_type}'"
                 )
                 return self._build_entity_pl_ebit_sql(intent, cube_id)
+
+            # ================================================================
+            # MULTI-METRIC DISPATCH
+            # When intent carries multi_metric_calcs (set by intent parser when 2+
+            # distinct calculations are detected), run each metric independently
+            # via _compile_multi_metric_sql and merge their results.
+            # This must fire BEFORE the single-calc use_calculation dispatch.
+            # Fallback: detect from original_query in case multi_metric_calcs was
+            # dropped during the Node.js intent round-trip.
+            # ================================================================
+            _multi_calcs = intent.get('multi_metric_calcs', [])
+            if not _multi_calcs and not is_nemko:
+                _orig_q = intent.get('original_query', '')
+                if _orig_q:
+                    _all_m = self.get_matching_calculation(
+                        _orig_q, {'calculations': []}, return_all=True)
+                    _all_names = list(dict.fromkeys(
+                        c.get('calculation_name', '')
+                        for c in _all_m if c.get('calculation_name')
+                    ))
+                    if len(_all_names) > 1:
+                        logger.info(
+                            f"compile_sql: fallback multi-metric detection "
+                            f"from original_query → {_all_names}")
+                        _multi_calcs = _all_names
+            if _multi_calcs and len(_multi_calcs) > 1:
+                metric_ids = [c.lower().replace(' ', '_') for c in _multi_calcs]
+                logger.info(
+                    f"compile_sql: multi_metric_calcs dispatch → {metric_ids}")
+                return self._compile_multi_metric_sql(
+                    metric_ids, cube_id, intent, domain)
 
             # ================================================================
             # USE_CALCULATION PRE-SET DISPATCH
