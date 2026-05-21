@@ -883,7 +883,7 @@ Given a user query, identify:
 3. How to group results (entity, salary_level, sector, etc.)
 4. Any filters to apply (including view filters)
 
-METRIC CATALOG (choose EXACTLY one metric_id):
+METRIC CATALOG (choose one or more metric_ids — include ALL metrics the user asks about):
 {metrics}
 
 VIEW FILTERS (add to filters if user mentions these):
@@ -932,7 +932,7 @@ MONTH AND QUARTER RULES:
 
 Respond with ONLY valid JSON (no markdown, no explanation):
 {{
-  "metric": "<exact metric_id from catalog>",
+  "metrics": ["<metric_id_1>", "<metric_id_2_if_requested>"],
   "year": <number>,
   "month": <single number, list of numbers, or null for YTD>,
   "group_by": ["<grouping columns>"],
@@ -940,6 +940,10 @@ Respond with ONLY valid JSON (no markdown, no explanation):
   "view": "<MS|SX|VM|PS|XC|Entity or null>",
   "confidence": <0.0 to 1.0>
 }}
+
+IMPORTANT: "metrics" is ALWAYS an array, even for a single metric.
+If the user asks for multiple metrics (e.g. "offshore capacity AND budget"), list ALL of them.
+If the user asks for ONE metric, still use an array with one element: ["metric_id"].
 
 USER QUERY: {query}"""
 
@@ -954,9 +958,21 @@ def parse_query_with_llm(query: str, openai_client=None) -> Dict[str, Any]:
             if result_text.startswith("json"): result_text = result_text[4:]
             result_text = result_text.strip()
         parsed = json.loads(result_text)
-        metric_id = parsed.get("metric", "")
-        if metric_id not in METRIC_CATALOG:
-            return {"success": False, "error": f"Unknown metric: {metric_id}", "raw_response": parsed}
+        # Support both "metrics": [...] (new) and "metric": "..." (legacy backward compat)
+        raw_metrics = parsed.get("metrics")
+        if not raw_metrics:
+            legacy = parsed.get("metric", "")
+            raw_metrics = [legacy] if legacy else []
+        if not raw_metrics:
+            return {"success": False, "error": "No metric returned by LLM", "raw_response": parsed}
+        # Validate all metric IDs — keep only known ones
+        valid_metrics = [m for m in raw_metrics if m in METRIC_CATALOG]
+        if not valid_metrics:
+            return {"success": False, "error": f"Unknown metric(s): {raw_metrics}", "raw_response": parsed}
+        # Primary metric (first valid) for backward compat fields
+        metric_id = valid_metrics[0]
+        parsed["metric"] = metric_id
+        parsed["metrics"] = valid_metrics
         parsed["builder"] = METRIC_CATALOG[metric_id]["builder"]
         parsed["success"] = True
         view = parsed.get("view", "").upper() if parsed.get("view") else None
@@ -11238,6 +11254,109 @@ Return a JSON object with:
 
     # ==================== END NEMKO P&L SQL BUILDERS ====================
 
+    def _compile_multi_metric_sql(
+        self,
+        metric_ids: List[str],
+        cube_id: str,
+        intent: Dict[str, Any],
+        domain: str = None,
+    ) -> Dict[str, Any]:
+        """
+        Run each metric builder independently (with its own intent copy) then
+        merge the result rows on shared dimension columns (region_entity, month,
+        year, etc.).  If any builder fails, its column is silently omitted so
+        the rest of the results still surface.
+        """
+        import copy, time
+        start = time.time()
+        all_results: List[Dict[str, Any]] = []
+        sql_queries: List[str] = []
+        failed: List[str] = []
+
+        for metric_id in metric_ids:
+            metric_intent = copy.deepcopy(intent)
+            metric_intent['use_calculation'] = metric_id
+            try:
+                compile_result = self.compile_calculation_sql(metric_id, cube_id, metric_intent, domain)
+                if not compile_result.get('success'):
+                    logger.warning(f"[MULTI-METRIC] compile failed for '{metric_id}': {compile_result.get('error')}")
+                    failed.append(metric_id)
+                    continue
+                sql = compile_result.get('sql') or compile_result.get('sql_query', '')
+                params = compile_result.get('params', [])
+                if not sql:
+                    logger.warning(f"[MULTI-METRIC] No SQL generated for '{metric_id}'")
+                    failed.append(metric_id)
+                    continue
+                exec_result = self.execute_query(sql, params, cube_id, user_id='system', skip_logging=True)
+                if exec_result.get('success') and exec_result.get('results') is not None:
+                    all_results.append({'metric_id': metric_id, 'rows': exec_result['results']})
+                    sql_queries.append(f"-- {metric_id}\n{sql}")
+                else:
+                    logger.warning(f"[MULTI-METRIC] execute failed for '{metric_id}': {exec_result.get('error')}")
+                    failed.append(metric_id)
+            except Exception as e:
+                logger.warning(f"[MULTI-METRIC] Exception for '{metric_id}': {e}")
+                failed.append(metric_id)
+
+        if not all_results:
+            return {
+                'success': False,
+                'error': f"All metric builders failed: {metric_ids}",
+                'use_rag': True,
+            }
+
+        # ── Merge rows on shared dimension keys ───────────────────────────────
+        # Dimension columns are non-numeric keys.  We use the first result's
+        # column set to detect them, then join subsequent results on those keys.
+        KNOWN_DIMENSION_KEYS = {
+            'region_entity', 'month', 'year', 'sector', 'salary_level',
+            'project_gb', 'planning_gb', 'resource_type', 'onsite_offshore',
+            'new_service_area', 'service_area', 'employee_number', 'employee_name',
+        }
+
+        def _dim_keys(rows: List[Dict]) -> List[str]:
+            if not rows:
+                return []
+            return [k for k in rows[0].keys() if k in KNOWN_DIMENSION_KEYS]
+
+        # Build merged dict keyed by frozenset of dim-key values
+        merged: Dict[tuple, Dict[str, Any]] = {}
+
+        for entry in all_results:
+            rows = entry['rows']
+            if not rows:
+                continue
+            dim_keys = _dim_keys(rows)
+            for row in rows:
+                key = tuple(row.get(k) for k in dim_keys) if dim_keys else ('__total__',)
+                if key not in merged:
+                    merged[key] = {k: row[k] for k in dim_keys} if dim_keys else {}
+                # Add all non-dimension columns from this row
+                for col, val in row.items():
+                    if col not in KNOWN_DIMENSION_KEYS:
+                        merged[key][col] = val
+
+        merged_rows = list(merged.values())
+        all_columns = list(merged_rows[0].keys()) if merged_rows else []
+
+        elapsed_ms = int((time.time() - start) * 1000)
+        logger.info(
+            f"[MULTI-METRIC] Merged {len(metric_ids)} metrics → {len(merged_rows)} rows "
+            f"in {elapsed_ms}ms. Failed: {failed}"
+        )
+
+        return {
+            'success': True,
+            'results': merged_rows,
+            'row_count': len(merged_rows),
+            'columns': all_columns,
+            'sql_query': '\n\n'.join(sql_queries),
+            'execution_ms': elapsed_ms,
+            'currency': intent.get('currency', 'usd'),
+            'calculation_type': 'multi_metric',
+        }
+
     def compile_sql(self,
                     intent: Dict[str, Any],
                     cube_id: str,
@@ -11496,11 +11615,16 @@ Return a JSON object with:
 
                     if llm_result.get('success') and llm_result.get(
                             'confidence', 0) >= 0.7:
-                        metric_id = llm_result.get('metric')
+                        # Support both "metrics": [...] (new) and "metric": "..." (legacy)
+                        metric_ids_llm = llm_result.get('metrics') or []
+                        if not metric_ids_llm and llm_result.get('metric'):
+                            metric_ids_llm = [llm_result['metric']]
+                        metric_ids_llm = [m for m in metric_ids_llm if m]
+                        metric_id = metric_ids_llm[0] if metric_ids_llm else None
                         builder_name = llm_result.get('builder')
 
                         logger.info(
-                            f"LLM routing: metric={metric_id}, confidence={llm_result.get('confidence')}, builder={builder_name}"
+                            f"LLM routing: metrics={metric_ids_llm}, confidence={llm_result.get('confidence')}, builder={builder_name}"
                         )
 
                         # Update intent with LLM-parsed values
@@ -11576,11 +11700,19 @@ Return a JSON object with:
                                         'value': val
                                     })
 
-                        # Set use_calculation from LLM result for routing
+                        # Set primary use_calculation from first metric (backward compat)
                         intent['use_calculation'] = metric_id
                         use_calculation = metric_id
 
-                        # Route to the builder via compile_calculation_sql
+                        # ── Multi-metric: run each builder then merge ──────────
+                        if len(metric_ids_llm) > 1:
+                            logger.info(
+                                f"[MULTI-METRIC] Detected {len(metric_ids_llm)} metrics: {metric_ids_llm}"
+                            )
+                            return self._compile_multi_metric_sql(
+                                metric_ids_llm, cube_id, intent, domain)
+
+                        # Single metric: existing path unchanged
                         return self.compile_calculation_sql(
                             metric_id, cube_id, intent, domain)
                     else:
