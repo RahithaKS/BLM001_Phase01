@@ -3178,10 +3178,14 @@ IMPORTANT: When in doubt, preserve the original text. Only fix clear typos."""
 
     def get_matching_calculation(
             self, query: str,
-            business_logic: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            business_logic: Dict[str, Any],
+            return_all: bool = False):
         """
         Find a matching calculation rule for the query.
         Detects KPI keywords like 'billing utilization', 'price mix', 'attrition rate', etc.
+
+        If return_all=True, returns a List[Dict] of ALL distinct matching calcs found in the
+        query (used for multi-metric detection).  Otherwise returns the first match or None.
         """
         query_lower = query.lower()
 
@@ -3382,6 +3386,22 @@ IMPORTANT: When in doubt, preserve the original text. Only fix clear typos."""
         sorted_triggers = sorted(kpi_triggers.items(),
                                  key=lambda x: len(x[0]),
                                  reverse=True)
+
+        # ── return_all mode: collect EVERY distinct calc name that fires ──────
+        if return_all:
+            seen_names: Dict[str, Any] = {}  # calc_name → calc dict (dedup)
+            for trigger, calc_name in sorted_triggers:
+                if trigger in query_lower and calc_name not in seen_names:
+                    # Look up full calc object
+                    for calc in business_logic.get("calculations", []):
+                        if calc.get("calculation_name", "").lower() == calc_name.lower():
+                            seen_names[calc_name] = calc
+                            break
+                    else:
+                        seen_names[calc_name] = {"calculation_name": calc_name, "triggered_by": trigger}
+            return list(seen_names.values())
+
+        # ── normal mode: return first match (existing behaviour) ──────────────
 
         # First pass: Exact substring match
         for trigger, calc_name in sorted_triggers:
@@ -5058,37 +5078,55 @@ Return a JSON object with:
             calc_name = matching_calc.get('calculation_name', '')
             calc_lower = calc_name.lower()
             if any(kpi in calc_lower for kpi in kpi_keywords):
-                logger.info(
-                    f"FAST PATH: Skipping OpenAI for KPI calculation: {calc_name}"
+                # ── MULTI-METRIC CHECK ────────────────────────────────────────
+                # If the query triggers 2+ distinct calculations, skip the fast
+                # path so LLM routing (which supports metrics[]) can handle it.
+                all_matched = self.get_matching_calculation(
+                    query, business_logic, return_all=True)
+                all_unique_names = list(
+                    dict.fromkeys(
+                        c.get('calculation_name', '') for c in all_matched
+                        if c.get('calculation_name')
+                    )
                 )
-                # Build minimal intent with extracted year/month and group_by from query
-                intent = self._build_kpi_intent_fast(query, calc_name,
-                                                     entity_filters,
-                                                     group_by_hint=_gb_group_by_hint)
+                if len(all_unique_names) > 1:
+                    logger.info(
+                        f"MULTI-METRIC: {len(all_unique_names)} calcs detected "
+                        f"{all_unique_names} — skipping fast path, routing to LLM"
+                    )
+                    # Fall through to LLM routing (do NOT return here)
+                else:
+                    logger.info(
+                        f"FAST PATH: Skipping OpenAI for KPI calculation: {calc_name}"
+                    )
+                    # Build minimal intent with extracted year/month and group_by from query
+                    intent = self._build_kpi_intent_fast(query, calc_name,
+                                                         entity_filters,
+                                                         group_by_hint=_gb_group_by_hint)
 
-                # Apply time scope and default filters
-                time_scope = detect_time_scope_from_query(query)
-                logger.info(f"Detected time scope: {time_scope}")
-                intent = self.apply_default_time_filters(
-                    intent, cube_id, time_scope)
-                intent['use_calculation'] = calc_name
-                intent['original_query'] = query
+                    # Apply time scope and default filters
+                    time_scope = detect_time_scope_from_query(query)
+                    logger.info(f"Detected time scope: {time_scope}")
+                    intent = self.apply_default_time_filters(
+                        intent, cube_id, time_scope)
+                    intent['use_calculation'] = calc_name
+                    intent['original_query'] = query
 
-                # POST-PROCESSING: Fix cost_category exact matching, metrics, and
-                # include_exclude filter (adds 'Include' for WW revenue queries).
-                # This was previously only called on the LLM path — fast-path needs it too.
-                intent = self._fix_cost_category_and_metrics(intent, query)
+                    # POST-PROCESSING: Fix cost_category exact matching, metrics, and
+                    # include_exclude filter (adds 'Include' for WW revenue queries).
+                    # This was previously only called on the LLM path — fast-path needs it too.
+                    intent = self._fix_cost_category_and_metrics(intent, query)
 
-                # Return in the same format as OpenAI path
-                return {
-                    'success': True,
-                    'intent': intent,
-                    'raw_query': query,
-                    'matched_calculation': matching_calc,
-                    'business_logic': business_logic,
-                    'time_scope': time_scope,
-                    'view_type': detected_view_type
-                }
+                    # Return in the same format as OpenAI path
+                    return {
+                        'success': True,
+                        'intent': intent,
+                        'raw_query': query,
+                        'matched_calculation': matching_calc,
+                        'business_logic': business_logic,
+                        'time_scope': time_scope,
+                        'view_type': detected_view_type
+                    }
 
         # FAST PATH: View-trigger budget queries (e.g. "SX Budget", "MS Budget")
         # When a view trigger is present and the query mentions "budget" or "revenue",
