@@ -1,0 +1,13 @@
+kind = "web"
+previewPath = "/"
+title = "LedgerLM"
+version = "1.0.0"
+id = "ledgerlm-main"
+
+[[services]]
+localPort = 5000
+name = "LedgerLM"
+paths = ["/"]
+
+[services.development]
+run = "cd ledgerlm && npm run dev"
