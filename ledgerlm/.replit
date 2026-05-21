@@ -1,0 +1,54 @@
+modules = ["nodejs-20", "web", "python-3.11", "python3", "postgresql-16"]
+run = "npm run dev"
+hidden = [".config", ".git", "generated-icon.png", "node_modules", "dist"]
+
+[nix]
+channel = "stable-24_05"
+packages = ["cargo", "freetype", "glibcLocales", "gmp", "lcms2", "libiconv", "libimagequant", "libjpeg", "libtiff", "libwebp", "libxcrypt", "openjpeg", "pkg-config", "poppler_utils", "rustc", "tcl", "tesseract", "tk", "xcodebuild", "xsimd", "zlib"]
+
+[deployment]
+deploymentTarget = "autoscale"
+build = ["npm", "run", "build"]
+run = ["npm", "run", "start"]
+
+[[ports]]
+localPort = 5000
+externalPort = 80
+
+[[ports]]
+localPort = 8000
+externalPort = 8000
+
+[env]
+PORT = "5000"
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Start application"
+
+[[workflows.workflow]]
+name = "Start application"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "npm run dev"
+waitForPort = 5000
+
+[agent]
+integrations = ["javascript_mem_db:1.0.0", "javascript_database:1.0.0"]
+
+[userenv]
+
+[userenv.shared]
+OLLAMA_BASE_URL = "https://ollama.ledgerlm.ai"
+OLLAMA_CHAT_MODEL = "qwen2.5:32b"
+OLLAMA_EMBEDDING_MODEL = "mxbai-embed-large"

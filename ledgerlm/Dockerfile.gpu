@@ -1,0 +1,206 @@
+# ================================
+# LedgerLM GPU-Enabled Dockerfile
+# ================================
+# For Bosch VM with NVIDIA Tesla T4 GPU
+# CUDA 12.2 Support
+
+# ================================
+# Stage 1: Build Node.js Frontend + Backend
+# ================================
+FROM node:20-bullseye AS node-builder
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci
+
+COPY client ./client
+COPY server ./server
+COPY shared ./shared
+COPY attached_assets ./attached_assets
+COPY tsconfig.json ./
+COPY tailwind.config.ts ./
+COPY postcss.config.js ./
+COPY vite.config.production.ts ./vite.config.ts
+
+RUN npm run build && echo "=== Verifying frontend build ===" && ls -la server/public/ && test -f server/public/index.html && echo "=== Frontend build successful ==="
+
+# ================================
+# Stage 2: Production Image with GPU Support
+# ================================
+FROM nvidia/cuda:12.2.2-runtime-ubuntu22.04
+
+# Install Node.js 20
+RUN apt-get update && apt-get install -y curl gnupg && \
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs
+
+# Install Python and system dependencies
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    python3-venv \
+    tesseract-ocr \
+    poppler-utils \
+    nginx \
+    supervisor \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install production dependencies only
+RUN npm ci --only=production
+
+# Install tsx for running TypeScript server in production
+RUN npm install -g tsx
+
+# Install vite (needed for server/vite.ts imports even in production mode)
+# Install drizzle-kit for database migrations
+# Install nanoid (used in server/vite.ts)
+RUN npm install vite drizzle-kit nanoid
+
+# Copy server code from builder
+COPY --from=node-builder /app/server ./server
+COPY shared ./shared
+COPY tsconfig.json ./
+
+# Copy attached_assets
+COPY attached_assets ./attached_assets
+
+# Copy vite config
+COPY --from=node-builder /app/vite.config.ts ./
+
+# Copy drizzle config for database migrations
+COPY drizzle.config.ts ./
+
+# Verify frontend files exist
+RUN echo "=== Verifying production frontend files ===" && ls -la server/public/ && test -f server/public/index.html && echo "=== Production frontend files verified ==="
+
+# ================================
+# Setup Python Backend
+# ================================
+WORKDIR /app/python_backend
+
+# Copy Python requirements first for caching
+COPY python_backend/requirements.txt ./
+
+# Create virtual environment and install dependencies
+RUN python3 -m venv /opt/venv && /opt/venv/bin/pip install --upgrade pip && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
+
+# Copy Python backend code
+COPY python_backend ./
+
+# ================================
+# Configure Nginx
+# ================================
+WORKDIR /app
+
+# Remove default Nginx config
+RUN rm -f /etc/nginx/sites-enabled/default
+
+# Create Nginx configuration
+RUN printf 'server { \n\
+    listen 80; \n\
+    server_name _; \n\
+    \n\
+    add_header X-Frame-Options "SAMEORIGIN" always; \n\
+    add_header X-Content-Type-Options "nosniff" always; \n\
+    add_header X-XSS-Protection "1; mode=block" always; \n\
+    \n\
+    client_max_body_size 500M; \n\
+    \n\
+    proxy_connect_timeout 600; \n\
+    proxy_send_timeout 600; \n\
+    proxy_read_timeout 600; \n\
+    send_timeout 600; \n\
+    \n\
+    location / { \n\
+        proxy_pass http://127.0.0.1:5000; \n\
+        proxy_http_version 1.1; \n\
+        proxy_set_header Upgrade $http_upgrade; \n\
+        proxy_set_header Connection "upgrade"; \n\
+        proxy_set_header Host $host; \n\
+        proxy_cache_bypass $http_upgrade; \n\
+        proxy_set_header X-Real-IP $remote_addr; \n\
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; \n\
+        proxy_set_header X-Forwarded-Proto $scheme; \n\
+    } \n\
+    \n\
+    location /api/python/ { \n\
+        proxy_pass http://127.0.0.1:8000/; \n\
+        proxy_set_header Host $host; \n\
+        proxy_set_header X-Real-IP $remote_addr; \n\
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; \n\
+        proxy_connect_timeout 300; \n\
+        proxy_send_timeout 300; \n\
+        proxy_read_timeout 300; \n\
+    } \n\
+}' > /etc/nginx/sites-available/ledgerlm && sed -i 's/\r$//' /etc/nginx/sites-available/ledgerlm
+
+# Enable site
+RUN ln -sf /etc/nginx/sites-available/ledgerlm /etc/nginx/sites-enabled/
+
+# Test Nginx config
+RUN nginx -t
+
+# ================================
+# Configure Supervisor (Process Manager)
+# ================================
+RUN printf '[supervisord] \n\
+nodaemon=true \n\
+user=root \n\
+logfile=/var/log/supervisor/supervisord.log \n\
+pidfile=/var/run/supervisord.pid \n\
+\n\
+[program:nginx] \n\
+command=/usr/sbin/nginx -g "daemon off;" \n\
+autostart=true \n\
+autorestart=true \n\
+stdout_logfile=/dev/stdout \n\
+stdout_logfile_maxbytes=0 \n\
+stderr_logfile=/dev/stderr \n\
+stderr_logfile_maxbytes=0 \n\
+\n\
+[program:node-backend] \n\
+command=/usr/bin/tsx server/index.ts \n\
+directory=/app \n\
+environment=NODE_ENV="production" \n\
+autostart=true \n\
+autorestart=true \n\
+startsecs=10 \n\
+stdout_logfile=/dev/stdout \n\
+stdout_logfile_maxbytes=0 \n\
+stderr_logfile=/dev/stderr \n\
+stderr_logfile_maxbytes=0 \n\
+\n\
+[program:python-backend] \n\
+command=/opt/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 \n\
+directory=/app/python_backend \n\
+environment=PYTHONPATH="/app/python_backend",DATABASE_URL="%%(ENV_DATABASE_URL)s",OPENAI_API_KEY="%%(ENV_OPENAI_API_KEY)s",DOCKER_ENV="true" \n\
+autostart=true \n\
+autorestart=true \n\
+startsecs=5 \n\
+stdout_logfile=/dev/stdout \n\
+stdout_logfile_maxbytes=0 \n\
+stderr_logfile=/dev/stderr \n\
+stderr_logfile_maxbytes=0' > /etc/supervisor/conf.d/ledgerlm.conf && sed -i 's/\r$//' /etc/supervisor/conf.d/ledgerlm.conf
+
+# Create directories
+RUN mkdir -p /app/uploads /var/log/supervisor && chmod 777 /app/uploads
+
+# Create startup script that runs migrations then starts supervisor
+# Use sed to remove any Windows carriage returns
+RUN printf '#!/bin/bash\nset -e\necho "=== Running database migrations ==="\ncd /app && npx drizzle-kit push --force 2>&1 || echo "Migration warning (continuing anyway)"\necho "=== Starting services ==="\nexec /usr/bin/supervisord -c /etc/supervisor/supervisord.conf\n' > /app/start.sh && sed -i 's/\r$//' /app/start.sh && chmod +x /app/start.sh
+
+# Expose port
+EXPOSE 80
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 CMD curl -f http://localhost/api/health || exit 1
+
+# Start with migration script
+CMD ["/app/start.sh"]

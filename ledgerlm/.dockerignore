@@ -1,0 +1,68 @@
+# Git
+.git
+.gitignore
+
+# Node modules (will be installed fresh in Docker)
+node_modules
+npm-debug.log*
+
+# Build outputs (will be created during Docker build)
+dist
+server/public
+
+# Development files
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test files
+*.test.ts
+*.test.js
+*.spec.ts
+*.spec.js
+__tests__
+coverage
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+venv
+.venv
+
+# Logs
+logs
+*.log
+
+# Temporary files
+tmp
+temp
+.tmp
+
+# Uploads (will be mounted as volume in production)
+uploads/*
+!uploads/.gitkeep
+
+# Drizzle migrations output
+drizzle
+
+# Development/Replit configs
+.replit
+replit.nix
+.upm
+.cache
+.config
+
+# Docker build artifacts
+ledgerlm-image.tar

@@ -1,0 +1,121 @@
+# ================================
+# LedgerLM Docker Compose Configuration
+# For Bosch Azure Deployment
+# ================================
+# Usage:
+#   1. Copy .env.example to .env and fill in values
+#   2. Run: docker-compose up -d
+#   3. Access at: http://localhost (or your domain)
+
+version: '3.8'
+
+services:
+  # ================================
+  # PostgreSQL Database with pgvector
+  # ================================
+  database:
+    image: pgvector/pgvector:pg16
+    container_name: ledgerlm-db
+    restart: always
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ledgerlm}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-ledgerlm}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    networks:
+      - ledgerlm-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ledgerlm} -d ${POSTGRES_DB:-ledgerlm}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ================================
+  # LedgerLM Application
+  # (Node.js + Python + Nginx in one container)
+  # ================================
+  app:
+    image: ${DOCKER_IMAGE:-boschledgerlm.azurecr.io/ledgerlm:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ledgerlm-app
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "${APP_PORT:-80}:80"
+    environment:
+      # Database Connection
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ledgerlm}:${POSTGRES_PASSWORD}@database:5432/${POSTGRES_DB:-ledgerlm}
+      
+      # Application Settings
+      NODE_ENV: production
+      PORT: 5000
+      PYTHON_BACKEND_URL: http://127.0.0.1:8000
+      
+      # OpenAI API (for AI features)
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      
+      # Email Configuration (SMTP)
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT:-465}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      SMTP_FROM: ${SMTP_FROM:-noreply@ledgerlm.com}
+      
+      # Anaplan Integration
+      ANAPLAN_WORKSPACE_ID: ${ANAPLAN_WORKSPACE_ID:-}
+      ANAPLAN_MODEL_ID: ${ANAPLAN_MODEL_ID:-}
+      ANAPLAN_PROCESS_ID: ${ANAPLAN_PROCESS_ID:-}
+      ANAPLAN_USERNAME: ${ANAPLAN_USERNAME:-}
+      ANAPLAN_PASSWORD: ${ANAPLAN_PASSWORD:-}
+      
+      # Google Search (optional - for web search feature)
+      GOOGLE_SEARCH_API_KEY: ${GOOGLE_SEARCH_API_KEY:-}
+      GOOGLE_SEARCH_ENGINE_ID: ${GOOGLE_SEARCH_ENGINE_ID:-}
+      
+      # Session Security
+      SESSION_SECRET: ${SESSION_SECRET}
+      
+      # Hardcoded Admin OTP (for nemkomatasma@nemko.com)
+      NEMKO_ADMIN_OTP: ${NEMKO_ADMIN_OTP:-}
+    
+    volumes:
+      - app_uploads:/app/uploads
+    
+    depends_on:
+      database:
+        condition: service_healthy
+    
+    networks:
+      - ledgerlm-network
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+
+# ================================
+# Named Volumes (Persistent Storage)
+# ================================
+volumes:
+  postgres_data:
+    driver: local
+  app_uploads:
+    driver: local
+
+# ================================
+# Network
+# ================================
+networks:
+  ledgerlm-network:
+    driver: bridge
