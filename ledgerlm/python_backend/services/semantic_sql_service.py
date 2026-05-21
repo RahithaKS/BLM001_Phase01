@@ -7293,25 +7293,17 @@ Return a JSON object with:
                 calc_name, formula, result_type, required_columns, default_filters, rounding, _ = result
                 calc_name_lower = calc_name.lower(
                 ) if calc_name else calculation_name.lower()
-                # If result found but has no sql_template, the admin hasn't defined one yet.
-                # Hardcoded builders are disabled — prompt admin to add a template.
+                # sql_template is empty — fall back to Python builders below
                 if not is_nemko:
-                    logger.warning(
+                    logger.info(
                         f"[DB-TEMPLATE] calc_rule found for '{calc_name}' but sql_template is empty. "
-                        f"Please add a SQL template in the Intelligence Studio."
+                        f"Falling back to Python builders."
                     )
-                    return {
-                        'success': False,
-                        'error': (
-                            f"SQL template not yet defined for '{calc_name}'. "
-                            f"Please add a SQL template in the Schema Intelligence Studio."
-                        ),
-                        'use_rag': True
-                    }
+                    # Fall through to METRIC_CATALOG / legacy builder routing below
             else:
-                # No DB result found — hardcoded Python builders are disabled.
-                # All metrics must have a sql_template defined in cube_calculation_rules
-                # via the Schema Intelligence Studio. This guarantees admin-controlled SQL.
+                # No DB record found — fall back to Python builders for Bosch domain.
+                calc_name_lower = calculation_name.lower()
+                rounding = 2  # default rounding
 
                 # Nemko domain has its own separate SQL builders (different schema)
                 if is_nemko:
@@ -7328,23 +7320,13 @@ Return a JSON object with:
                         'use_rag': True
                     }
 
-                # For all other domains: no DB template = no result.
-                # Hardcoded Python builders have been removed — define metrics in the
-                # Schema Intelligence Studio instead.
-                logger.warning(
-                    f"[DB-TEMPLATE] No sql_template found for '{calculation_name}' "
-                    f"(cube_id={cube_id}). Add a SQL template in the Intelligence Studio."
-                )
                 if db_error:
                     return {'success': False, 'error': f"Database error: {db_error}"}
-                return {
-                    'success': False,
-                    'error': (
-                        f"No SQL template found for '{calculation_name}'. "
-                        f"Please define a SQL template for this metric in the Schema Intelligence Studio."
-                    ),
-                    'use_rag': True
-                }
+
+                # Fall through to Python builder routing below
+                logger.info(
+                    f"[DB-TEMPLATE] No DB record for '{calculation_name}' — trying Python builders."
+                )
 
             # Extract filters and group_by from intent
             filters = intent.get('filters', [])
